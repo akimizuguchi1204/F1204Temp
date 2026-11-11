@@ -144,16 +144,28 @@ def validate_and_prepare_dataset(df: pd.DataFrame, farm_id: str) -> pd.DataFrame
     original_cols = list(df.columns)
     cleaned_headers = clean_column_names(original_cols)
 
-    # Map cleaned headers to canonical database columns
+    # Map cleaned headers to canonical database columns. Two headers can collapse onto the same
+    # canonical name (AnimalValue and Animal_Value both mean animalvalue), so the first one keeps
+    # the canonical column and the rest fall back to their own cleaned name as extra columns.
+    # Without this, the frame ends up with duplicate column names and the numeric cast fails.
     col_mapping: dict[str, str] = {}
+    used_targets: set[str] = set()
     for orig, cleaned in zip(original_cols, cleaned_headers):
         collapsed = cleaned.replace("_", "")
         if cleaned in CANONICAL_COL_MAP:
-            col_mapping[orig] = CANONICAL_COL_MAP[cleaned]
+            target = CANONICAL_COL_MAP[cleaned]
         elif collapsed in CANONICAL_COL_MAP:
-            col_mapping[orig] = CANONICAL_COL_MAP[collapsed]
+            target = CANONICAL_COL_MAP[collapsed]
         else:
-            col_mapping[orig] = cleaned
+            target = cleaned
+        if target in used_targets:
+            base = target = cleaned
+            suffix = 2
+            while target in used_targets:
+                target = f"{base}_{suffix}"
+                suffix += 1
+        used_targets.add(target)
+        col_mapping[orig] = target
 
     df_norm = df.rename(columns=col_mapping)
 

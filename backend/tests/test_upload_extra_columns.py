@@ -128,3 +128,31 @@ def test_suggestions_show_only_original_measures_with_data():
     # Only columns this farm has data in are reported, not every column in the shared table.
     assert "zz_bodyscore" in res["new_columns_detected"]
     assert "carcassweight" not in res["new_columns_detected"]
+
+
+def test_headers_that_collapse_to_the_same_canonical_column_stay_separate():
+    """AnimalValue and Animal_Value both collapse to animalvalue: the frame must not carry duplicates.
+
+    Regression for the ABC_2026-07-15.csv upload, which failed with "arg must be a list, tuple,
+    1-d array, or Series" because two columns renamed to the same canonical name and pd.to_numeric
+    was handed a DataFrame instead of a Series.
+    """
+    df = pd.DataFrame(
+        {
+            "EID": ["951 000327788544"],
+            "Date": ["01/07/2026"],
+            "weight": [486.0],
+            "AnimalValue": [2371.42],
+            "Animal_Value": [2371.42],
+            "AnimalProd": [1.83],
+            "Animal_Prod": [1.83],
+        }
+    )
+
+    out = farm_ingestion.validate_and_prepare_dataset(df, FARM)
+
+    cols = list(out.columns)
+    assert len(cols) == len(set(cols)), f"duplicate columns after mapping: {cols}"
+    assert {"animalvalue", "animal_value"} <= set(cols)
+    assert {"animalprod", "animal_prod"} <= set(cols)
+    assert len(out) == 1
