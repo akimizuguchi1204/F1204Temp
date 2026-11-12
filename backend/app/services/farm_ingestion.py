@@ -136,6 +136,19 @@ def load_table_from_bytes(content: bytes, filename: str) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(content))
 
 
+def _column_has_values(series: pd.Series) -> bool:
+    """True when a header carries any value an upload should keep.
+
+    A DataFrame means the source file already has this header twice; treat that as filled
+    so the duplicate-column check below still rejects it.
+    """
+    if isinstance(series, pd.DataFrame):
+        return True
+    if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_datetime64_any_dtype(series):
+        return bool(series.notna().any())
+    return bool(series.map(_text_or_none).notna().any())
+
+
 def validate_and_prepare_dataset(df: pd.DataFrame, farm_id: str) -> pd.DataFrame:
     """Validate mandatory fields, apply cleaning and column mapping, and format types."""
     if df.empty:
@@ -155,10 +168,47 @@ def validate_and_prepare_dataset(df: pd.DataFrame, farm_id: str) -> pd.DataFrame
         else:
             col_mapping[orig] = cleaned
 
+    # AnimalValue and Animal_Value both collapse to animalvalue. Feedlot exports often
+    # leave the canonical header empty and put the figures in the underscored alias.
+    # Keep the only filled series. Two aliases that both have values stay a 400:
+    # the file does not say which one is the measure. Identical headers (weight, Weight)
+    # are left for the duplicate check after rename.
+    cleaned_by_orig = dict(zip(original_cols, cleaned_headers))
+    by_target: dict[str, list[str]] = {}
+    for orig, target in col_mapping.items():
+        by_target.setdefault(target, []).append(orig)
+
+    drop_orig: list[str] = []
+    for target, origs in by_target.items():
+        if len(origs) < 2:
+            continue
+        if len({cleaned_by_orig[o] for o in origs}) == 1:
+            continue
+        filled = [o for o in origs if _column_has_values(df[o])]
+        if len(filled) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"File has duplicate columns after header cleanup: {target}. "
+                    "Rename or remove the extra column and re-upload."
+                ),
+            )
+        if len(filled) == 1:
+            keeper = filled[0]
+        else:
+            exact = [o for o in origs if cleaned_by_orig[o] == target]
+            keeper = exact[0] if exact else origs[0]
+        drop_orig.extend(o for o in origs if o != keeper)
+
+    if drop_orig:
+        df = df.drop(columns=drop_orig)
+        for orig in drop_orig:
+            del col_mapping[orig]
+
     df_norm = df.rename(columns=col_mapping)
 
-    # Two headers that clean to the same name (weight + Weight, pweight + p_weight)
-    # make df[col] a DataFrame. pd.to_numeric then raises TypeError instead of a 400.
+    # Two headers that clean to the same string (weight and Weight) make df[col]
+    # a DataFrame. pd.to_numeric then raises TypeError instead of a 400.
     duplicated = list(dict.fromkeys(df_norm.columns[df_norm.columns.duplicated()]))
     if duplicated:
         names = ", ".join(str(name) for name in duplicated)

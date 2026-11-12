@@ -34,3 +34,32 @@ def test_collapsed_alias_collision_is_rejected():
 
     assert exc_info.value.status_code == 400
     assert "pweight" in exc_info.value.detail
+
+
+def test_empty_canonical_header_keeps_filled_alias():
+    """AnimalValue is blank and Animal_Value holds the figures; keep those figures as animalvalue."""
+    raw = pd.DataFrame(
+        [["A1", "01/02/2024", "400", None, "12.5", None, "3.5"]],
+        columns=["EID", "Date", "weight", "AnimalValue", "Animal_Value", "AnimalProd", "Animal_Prod"],
+    )
+
+    out = validate_and_prepare_dataset(raw, "WOW")
+
+    assert list(out.columns).count("animalvalue") == 1
+    assert list(out.columns).count("animalprod") == 1
+    assert "animal_value" not in out.columns
+    assert "animal_prod" not in out.columns
+    assert out["animalvalue"].iloc[0] == pytest.approx(12.5)
+    assert out["animalprod"].iloc[0] == pytest.approx(3.5)
+
+
+def test_all_empty_alias_pair_collapses_to_one_column():
+    raw = pd.DataFrame(
+        [["A1", "01/02/2024", "400", None, None]],
+        columns=["EID", "Date", "weight", "AnimalValue", "Animal_Value"],
+    )
+
+    out = validate_and_prepare_dataset(raw, "WOW")
+
+    assert list(out.columns).count("animalvalue") == 1
+    assert pd.isna(out["animalvalue"].iloc[0])
