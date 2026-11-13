@@ -279,6 +279,22 @@ def validate_and_prepare_dataset(df: pd.DataFrame, farm_id: str) -> pd.DataFrame
     return df_ready
 
 
+def _add_columns(table: str, specs: list[tuple[str, str]]) -> None:
+    """Add columns in one statement on Postgres.
+
+    DuckDB allows only one ALTER action per statement, and a rejected multi-action
+    statement invalidates the connection, so local development adds them one by one.
+    """
+    if not specs:
+        return
+    if get_active_engine() == "postgres" and len(specs) > 1:
+        clause = ", ".join(f'ADD COLUMN IF NOT EXISTS "{name}" {sql_type}' for name, sql_type in specs)
+        execute(f"ALTER TABLE {table} {clause}")
+        return
+    for name, sql_type in specs:
+        execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{name}" {sql_type}')
+
+
 def _text_or_none(val: Any) -> str | None:
     if val is None or (isinstance(val, float) and val != val):
         return None
@@ -329,14 +345,15 @@ def sync_extra_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, list[s
         )
     if added:
         ensure_snapshot_tables()
-    for col in added:
-        sql_type = "DOUBLE PRECISION" if kinds[col] == "numeric" else "VARCHAR"
-        execute(f'ALTER TABLE animal_data ADD COLUMN IF NOT EXISTS "{col}" {sql_type}')
+        specs = [(col, "DOUBLE PRECISION" if kinds[col] == "numeric" else "VARCHAR") for col in added]
+        # One ALTER per table. A new farm file can add dozens of columns, and each
+        # separate ALTER is its own round trip and lock against Supabase.
+        _add_columns("animal_data", specs)
         try:
-            execute(f'ALTER TABLE animal_data_snapshots_data ADD COLUMN IF NOT EXISTS "{col}" {sql_type}')
+            _add_columns("animal_data_snapshots_data", specs)
         except Exception as exc:
-            # Snapshots then skip this column (farm_backup copies the columns both tables share).
-            logger.warning("Could not add %s to snapshot storage: %s", col, exc)
+            # Snapshots then skip these columns (farm_backup copies the columns both tables share).
+            logger.warning("Could not add new columns to snapshot storage: %s", exc)
 
     out = df.drop(columns=ignored)
     for col, kind in kinds.items():

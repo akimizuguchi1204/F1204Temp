@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from app.constants import CSV_COLUMN_MAP, MEASURE_CHOICES
-from app.db import FARM_COLUMNS_DDL, execute, fetch_all, fetch_one, table_column_types
+from app.db import FARM_COLUMNS_DDL, execute, fetch_all, fetch_one, get_conn, table_column_types
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,16 @@ class VariableService:
         )
         saved_map = {r["column_name"]: r for r in saved_rows}
 
+        measurable = [
+            r["column_name"]
+            for r in type_rows
+            if cls.classify_data_type(r["column_name"], r["data_type"]) in ("categorical", "numeric")
+            and SAFE_COLUMN_NAME.match(r["column_name"])
+        ]
+        # One scan of this farm. A new farm used to run this once per column, and animal_data
+        # carries every farm's columns, so the first upload waited on dozens of round trips.
+        stats = cls._value_stats(farm_id, measurable)
+
         results: list[dict[str, Any]] = []
         for r in type_rows:
             col_name = r["column_name"]
@@ -152,30 +162,8 @@ class VariableService:
 
             distinct_count = 0
             has_data = False
-            if kind in ("categorical", "numeric"):
-                try:
-                    cnt_row = fetch_one(
-                        f"""
-                        SELECT
-                            COUNT(DISTINCT "{col_name}") AS dist_cnt,
-                            CASE WHEN COUNT(*) > COUNT("{col_name}") THEN 1 ELSE 0 END AS has_null
-                        FROM animal_data
-                        WHERE farm_id = %s
-                        """,
-                        (farm_id,),
-                    )
-                    if cnt_row:
-                        distinct_count = int(cnt_row.get("dist_cnt") or 0) + int(
-                            cnt_row.get("has_null") or 0
-                        )
-                        has_data = int(cnt_row.get("dist_cnt") or 0) > 0
-                except Exception as exc:
-                    logger.warning(
-                        "Could not calculate distinct count for %s on farm %s: %s",
-                        col_name,
-                        farm_id,
-                        exc,
-                    )
+            if col_name in stats:
+                distinct_count, has_data = stats[col_name]
 
             suggested = col_name not in saved_map or force_rescan
             if not suggested:
@@ -229,6 +217,64 @@ class VariableService:
         return results
 
     @classmethod
+    def _value_stats(cls, farm_id: str, columns: list[str]) -> dict[str, tuple[int, bool]]:
+        """Distinct count (nulls count as one extra value) and whether the column has any value.
+
+        One query for the whole farm. Falls back to a query per column if that statement fails,
+        so one unreadable column does not zero the rest.
+        """
+        safe = [name for name in columns if SAFE_COLUMN_NAME.match(name)]
+        if not safe:
+            return {}
+        selects = ["COUNT(*) AS row_cnt"]
+        for name in safe:
+            selects.append(f'COUNT(DISTINCT "{name}") AS "{name}__d"')
+            selects.append(f'COUNT("{name}") AS "{name}__n"')
+        try:
+            row = fetch_one(
+                f"SELECT {', '.join(selects)} FROM animal_data WHERE farm_id = %s",
+                (farm_id,),
+            )
+        except Exception as exc:
+            logger.warning("Combined column stats failed for farm %s: %s", farm_id, exc)
+            return cls._value_stats_one_by_one(farm_id, safe)
+        if not row:
+            return {name: (0, False) for name in safe}
+        lowered = {str(key).lower(): value for key, value in row.items()}
+        total = int(lowered.get("row_cnt") or 0)
+        stats: dict[str, tuple[int, bool]] = {}
+        for name in safe:
+            distinct = int(lowered.get(f"{name}__d") or 0)
+            present = int(lowered.get(f"{name}__n") or 0)
+            stats[name] = (distinct + (1 if total > present else 0), distinct > 0)
+        return stats
+
+    @classmethod
+    def _value_stats_one_by_one(cls, farm_id: str, columns: list[str]) -> dict[str, tuple[int, bool]]:
+        stats: dict[str, tuple[int, bool]] = {}
+        for name in columns:
+            try:
+                cnt_row = fetch_one(
+                    f"""
+                    SELECT
+                        COUNT(DISTINCT "{name}") AS dist_cnt,
+                        CASE WHEN COUNT(*) > COUNT("{name}") THEN 1 ELSE 0 END AS has_null
+                    FROM animal_data
+                    WHERE farm_id = %s
+                    """,
+                    (farm_id,),
+                )
+            except Exception as exc:
+                logger.warning("Could not calculate distinct count for %s on farm %s: %s", name, farm_id, exc)
+                continue
+            if not cnt_row:
+                stats[name] = (0, False)
+                continue
+            distinct = int(cnt_row.get("dist_cnt") or 0)
+            stats[name] = (distinct + int(cnt_row.get("has_null") or 0), distinct > 0)
+        return stats
+
+    @classmethod
     def save_farm_columns(cls, farm_id: str, columns: list[dict[str, Any]]) -> None:
         """Validate mandatory weight measure invariant and persist configurations atomically.
 
@@ -263,6 +309,7 @@ class VariableService:
                 f"Configuration must include at least one weight measure ({', '.join(sorted(REQUIRED_WEIGHT_MEASURES))})"
             )
 
+        pending: list[tuple[Any, ...]] = []
         for col in columns:
             col_name = col["column_name"]
             kind = kind_of(col)
@@ -272,20 +319,24 @@ class VariableService:
             )
             is_shown = bool(col.get("is_shown")) and kind == "numeric"
             d_cnt = int(col.get("distinct_count") or 0)
+            pending.append((farm_id, col_name, kind, is_filter, is_shown, d_cnt))
 
-            execute(
-                """
-                INSERT INTO farm_columns (farm_id, column_name, kind, is_filter, is_shown, distinct_count, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT (farm_id, column_name) DO UPDATE SET
-                    kind = EXCLUDED.kind,
-                    is_filter = EXCLUDED.is_filter,
-                    is_shown = EXCLUDED.is_shown,
-                    distinct_count = EXCLUDED.distinct_count,
-                    updated_at = now()
-                """,
-                (farm_id, col_name, kind, is_filter, is_shown, d_cnt),
-            )
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for params in pending:
+                    cur.execute(
+                        """
+                        INSERT INTO farm_columns (farm_id, column_name, kind, is_filter, is_shown, distinct_count, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, now())
+                        ON CONFLICT (farm_id, column_name) DO UPDATE SET
+                            kind = EXCLUDED.kind,
+                            is_filter = EXCLUDED.is_filter,
+                            is_shown = EXCLUDED.is_shown,
+                            distinct_count = EXCLUDED.distinct_count,
+                            updated_at = now()
+                        """,
+                        params,
+                    )
 
         invalidate_active_columns(farm_id)
         # The pandas path selects enabled extra filter columns, so its cached frame may lack one.
