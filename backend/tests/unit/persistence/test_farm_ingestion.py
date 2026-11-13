@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 from fastapi import HTTPException
 
-from app.services.farm_ingestion import validate_and_prepare_dataset
+from app.services.farm_ingestion import upload_column_stats, validate_and_prepare_dataset
 
 
 def test_duplicate_headers_are_rejected_before_numeric_cast():
@@ -63,3 +63,20 @@ def test_all_empty_alias_pair_collapses_to_one_column():
 
     assert list(out.columns).count("animalvalue") == 1
     assert pd.isna(out["animalvalue"].iloc[0])
+
+
+def test_upload_column_stats_count_values_and_blanks():
+    frame = pd.DataFrame(
+        {
+            "breed": ["AA", "AA", None],
+            "weight": [400.0, None, 410.0],
+            "mob": ["Q3", "Q3", "Q4"],
+        }
+    )
+
+    stats = upload_column_stats(frame)
+
+    # One breed plus a blank, so the null counts as its own value.
+    assert stats["breed"] == (2, True)
+    assert stats["weight"] == (3, True)
+    assert stats["mob"] == (2, True)

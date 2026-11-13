@@ -295,6 +295,31 @@ def _add_columns(table: str, specs: list[tuple[str, str]]) -> None:
         execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{name}" {sql_type}')
 
 
+def upload_column_stats(df: pd.DataFrame) -> dict[str, tuple[int, bool]]:
+    """Distinct counts for this file, with nulls as one extra value.
+
+    The upload already holds the rows. Counting them here avoids a second pass over
+    animal_data, which also contains every other farm's columns.
+    """
+    total = len(df)
+    stats: dict[str, tuple[int, bool]] = {}
+    for name in df.columns:
+        key = str(name)
+        if not EXTRA_COLUMN_NAME.match(key):
+            continue
+        series = df[name]
+        if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_datetime64_any_dtype(series):
+            present = series.notna()
+            distinct = int(series.nunique(dropna=True))
+        else:
+            text = series.map(_text_or_none)
+            present = text.notna()
+            distinct = int(text.nunique(dropna=True))
+        present_n = int(present.sum())
+        stats[key] = (distinct + (1 if total > present_n else 0), distinct > 0)
+    return stats
+
+
 def _text_or_none(val: Any) -> str | None:
     if val is None or (isinstance(val, float) and val != val):
         return None

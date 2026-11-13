@@ -1568,10 +1568,13 @@ async function renderAdmin(container) {
     btn.disabled = true;
     setProgress(0);
     try {
+    const wantForecast = !document.getElementById('admin-skip-forecast').checked;
+    // Forecasts are a second request. A new farm's first upload used to build 182 days
+    // of predictions inside the same call that stored the rows, and that call did not return.
     const fields = {
       filename: file.name,
       duplicate_mode: document.getElementById('admin-duplicate-mode').value,
-      forecast: !document.getElementById('admin-skip-forecast').checked,
+      forecast: false,
     };
     let res;
     if (file.size > 4 * 1024 * 1024 && window.location.hostname.includes('vercel.app')) {
@@ -1580,13 +1583,25 @@ async function renderAdmin(container) {
     } else {
       res = await apiUploadSingle(`/admin/farms/${farmId}/upload`, file, fields, setProgress);
     }
-    clearInterval(processingTimer);
+    const added = res.columns_added || [];
+    const ignored = res.columns_ignored || [];
+    const columnsNote = (added.length ? ` New columns added: ${added.join(', ')}.` : '')
+      + (ignored.length ? ` Columns not kept (empty or unusable): ${ignored.join(', ')}.` : '');
+    const saved = `Inserted ${res.rows_inserted ?? 0}, skipped ${res.rows_skipped ?? 0}, overwritten ${res.rows_overwritten ?? 0}.${columnsNote}`;
+    resultEl.textContent = wantForecast ? `${saved} Refreshing forecasts…` : saved;
     loadCard('status');
     loadCard('uploads');
     loadCard('snapshots');
     loadCard('columns');
+    if (wantForecast) {
+      try {
+        res.forecasts = await apiFetch(`/admin/farms/${farmId}/forecasts/refresh`, { method: 'POST' });
+      } catch (err) {
+        res.forecasts = { status: 'failed', detail: err.message };
+      }
+    }
     if (typeof refreshFarmFilterMetadata === 'function') {
-      await refreshFarmFilterMetadata(farmId);
+      refreshFarmFilterMetadata(farmId);
     }
 
     if (res.initial_ingest) {
@@ -1623,15 +1638,10 @@ async function renderAdmin(container) {
       });
     }
 
-    const added = res.columns_added || [];
-    const ignored = res.columns_ignored || [];
-    const columnsNote = (added.length ? ` New columns added: ${added.join(', ')}.` : '')
-      + (ignored.length ? ` Columns not kept (empty or unusable): ${ignored.join(', ')}.` : '');
-    const done = `Inserted ${res.rows_inserted ?? 0}, skipped ${res.rows_skipped ?? 0}, overwritten ${res.rows_overwritten ?? 0}.${columnsNote} ${formatForecastOutcome(res.forecasts || {})}`;
+    const done = `${saved} ${formatForecastOutcome(res.forecasts || {})}`;
     resultEl.textContent = done;
     showToast('Upload complete', 'success');
   } catch (err) {
-    clearInterval(processingTimer);
     resultEl.textContent = err.message;
     showToast(err.message, 'error');
   } finally {

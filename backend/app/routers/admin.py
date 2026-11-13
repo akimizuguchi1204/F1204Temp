@@ -47,6 +47,7 @@ from app.services.farm_ingestion import (
     ingest_farm_data,
     load_table_from_bytes,
     sync_extra_columns,
+    upload_column_stats,
     validate_and_prepare_dataset,
 )
 from app.routers.farms import (
@@ -358,7 +359,10 @@ async def _ingest_farm_file(
     )
     invalidate_farm_caches(farm_id)
 
-    upload_cols_res = VariableService.on_farm_upload(farm_id)
+    upload_cols_res = VariableService.on_farm_upload(
+        farm_id,
+        column_stats=None if is_mocked else upload_column_stats(df),
+    )
 
     try:
         from app.services.anomaly_service import clear_anomaly_cache

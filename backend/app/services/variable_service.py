@@ -124,7 +124,10 @@ class VariableService:
 
     @classmethod
     def inspect_and_suggest_columns(
-        cls, farm_id: str, force_rescan: bool = False
+        cls,
+        farm_id: str,
+        force_rescan: bool = False,
+        column_stats: dict[str, tuple[int, bool]] | None = None,
     ) -> list[dict[str, Any]]:
         """Inspect animal_data schema for farm_id and calculate distinct counts with NULL weighting.
 
@@ -150,9 +153,9 @@ class VariableService:
             if cls.classify_data_type(r["column_name"], r["data_type"]) in ("categorical", "numeric")
             and SAFE_COLUMN_NAME.match(r["column_name"])
         ]
-        # One scan of this farm. A new farm used to run this once per column, and animal_data
-        # carries every farm's columns, so the first upload waited on dozens of round trips.
-        stats = cls._value_stats(farm_id, measurable)
+        # An upload passes counts from the file it just stored. Otherwise one query covers
+        # this farm; animal_data also holds every other farm's columns.
+        stats = column_stats if column_stats is not None else cls._value_stats(farm_id, measurable)
 
         results: list[dict[str, Any]] = []
         for r in type_rows:
@@ -164,6 +167,9 @@ class VariableService:
             has_data = False
             if col_name in stats:
                 distinct_count, has_data = stats[col_name]
+            elif column_stats is not None and col_name in saved_map:
+                # This file did not include the column. Keep the count already stored for it.
+                distinct_count = int(saved_map[col_name].get("distinct_count") or 0)
 
             suggested = col_name not in saved_map or force_rescan
             if not suggested:
@@ -428,10 +434,16 @@ class VariableService:
         return data
 
     @classmethod
-    def on_farm_upload(cls, farm_id: str) -> dict[str, Any]:
-        """Triggered on farm upload: seeds defaults if new; registers newly discovered columns."""
+    def on_farm_upload(
+        cls, farm_id: str, column_stats: dict[str, tuple[int, bool]] | None = None
+    ) -> dict[str, Any]:
+        """Triggered on farm upload: seeds defaults if new; registers newly discovered columns.
+
+        column_stats comes from the uploaded frame. Passing it skips the table scan that
+        otherwise recounts every shared column before the response can return.
+        """
         cls.ensure_schema()
-        inspected = cls.inspect_and_suggest_columns(farm_id)
+        inspected = cls.inspect_and_suggest_columns(farm_id, column_stats=column_stats)
         saved = fetch_all(
             "SELECT column_name FROM farm_columns WHERE farm_id = %s", (farm_id,)
         )
